@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "C:\Users\mtsthgo\Desktop\SERVER DE VERIFICACION\server.py", line 11, in <module>
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
+ImportError: cannot import name 'PBKDF2' from 'cryptography.hazmat.primitives.kdf.pbkdf2' (C:\Users\mtsthgo\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\cryptography\hazmat\primitives\kdf\pbkdf2.py)
