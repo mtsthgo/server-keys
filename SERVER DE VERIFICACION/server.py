@@ -1,4 +1,5 @@
 import sqlite3
+import ssl
 import uuid
 import json
 import os
@@ -10,15 +11,40 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
+# Soporte opcional para Postgres (Neon/Supabase) si psycopg está instalado.
+try:
+    import psycopg2
+    import psycopg2.pool
+    _HAS_PG = True
+except ImportError:
+    _HAS_PG = False
+
 app = Flask(__name__)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "licenses.db")
+# Si DATABASE_URL está configurado, se usa Postgres externo (persistente).
+# Respaldo hardcodeado para que funcione sin tocar variables de entorno.
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://neondb_owner:npg_8IEZhSiMnwH3@ep-patient-block-acbpl692.sa-east-1.aws.neon.tech/neondb?sslmode=require",
+)
 SECRET_KEY = os.environ.get(
     "LICENSE_SECRET",
     "cambia-esta-clave-por-una-segura-en-produccion-32bytes!"
 )
 SALT = b"license-salt-muy-segura"
 TOKEN_TTL_HOURS = 2
+
+_pg_pool = None
+
+
+def _pg_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        _pg_pool = psycopg2.pool.SimpleConnectionPool(
+            1, 10, dsn=DATABASE_URL, sslmode="require"
+        )
+    return _pg_pool
 
 
 def _derive_fernet_key() -> bytes:
@@ -36,14 +62,63 @@ def get_cipher() -> Fernet:
     return Fernet(_derive_fernet_key())
 
 
+USE_PG = bool(DATABASE_URL) and _HAS_PG
+
+
+def _pg_exec(conn, raw_sql, args=None, fetch=None):
+    """Ejecuta SQL cruda en Postgres y normaliza el resultado a dicts."""
+    cur = conn.cursor()
+    cur.execute(raw_sql, args or ())
+    if fetch == "one":
+        cols = [d[0] for d in cur.description] if cur.description else []
+        row = cur.fetchone()
+        result = dict(zip(cols, row)) if row else None
+    elif fetch == "all":
+        cols = [d[0] for d in cur.description] if cur.description else []
+        result = [dict(zip(cols, r)) for r in cur.fetchall()]
+    else:
+        result = None
+    cur.close()
+    conn.commit()
+    return result
+
+
 def get_db():
+    """Devuelve una conexión (Postgres si está configurado, si no SQLite)."""
+    if USE_PG:
+        return _pg_pool().getconn()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
+def close_db(conn):
+    if USE_PG:
+        _pg_pool().putconn(conn)
+    else:
+        conn.close()
+
+
 def init_db():
+    if USE_PG:
+        conn = get_db()
+        try:
+            _pg_exec(conn, """
+                CREATE TABLE IF NOT EXISTS licenses (
+                    id SERIAL PRIMARY KEY,
+                    key TEXT UNIQUE NOT NULL,
+                    client_name TEXT NOT NULL DEFAULT '',
+                    start_date TEXT NOT NULL,
+                    duration_days DOUBLE PRECISION NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active'
+                )
+            """)
+        finally:
+            close_db(conn)
+        return
+
     conn = get_db()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS licenses (
@@ -86,15 +161,21 @@ def generate():
 
     conn = get_db()
     try:
-        conn.execute(
-            "INSERT INTO licenses (key, client_name, start_date, duration_days, status) VALUES (?, ?, ?, ?, 'active')",
-            (license_key, client_name, start.isoformat(), duration),
-        )
-        conn.commit()
-    except sqlite3.IntegrityError:
-        return jsonify({"error": "La key generada ya existe (intenta de nuevo)"}), 500
-    finally:
-        conn.close()
+        if USE_PG:
+            _pg_exec(conn, """
+                INSERT INTO licenses (key, client_name, start_date, duration_days, status)
+                VALUES (%s, %s, %s, %s, 'active')
+            """, (license_key, client_name, start.isoformat(), duration))
+        else:
+            conn.execute(
+                "INSERT INTO licenses (key, client_name, start_date, duration_days, status) VALUES (?, ?, ?, ?, 'active')",
+                (license_key, client_name, start.isoformat(), duration),
+            )
+            conn.commit()
+    except Exception:
+        close_db(conn)
+        return jsonify({"error": "No se pudo guardar la key"}), 500
+    close_db(conn)
 
     expires = start + timedelta(days=duration)
 
@@ -118,10 +199,13 @@ def validate():
         return jsonify({"error": "Parámetro 'key' requerido"}), 400
 
     conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM licenses WHERE key = ?", (license_key,)
-    ).fetchone()
-    conn.close()
+    if USE_PG:
+        row = _pg_exec(conn, "SELECT * FROM licenses WHERE key = %s", (license_key,), fetch="one")
+    else:
+        row = conn.execute(
+            "SELECT * FROM licenses WHERE key = ?", (license_key,)
+        ).fetchone()
+    close_db(conn)
 
     if row is None:
         return jsonify({"valid": False, "reason": "KEY_NOT_FOUND"}), 404
@@ -180,10 +264,14 @@ def verify_token():
 @app.route("/disable-all", methods=["POST"])
 def disable_all():
     conn = get_db()
-    conn.execute("UPDATE licenses SET status = 'disabled' WHERE status = 'active'")
-    count = conn.execute("SELECT changes()").fetchone()[0]
-    conn.commit()
-    conn.close()
+    if USE_PG:
+        _pg_exec(conn, "UPDATE licenses SET status = 'disabled' WHERE status = 'active'")
+        count = _pg_exec(conn, "SELECT count(*) AS c FROM licenses WHERE status = 'disabled'", fetch="one")["c"]
+    else:
+        conn.execute("UPDATE licenses SET status = 'disabled' WHERE status = 'active'")
+        count = conn.execute("SELECT changes()").fetchone()[0]
+        conn.commit()
+    close_db(conn)
     return jsonify({"status": "ok", "disabled_keys": count})
 
 
