@@ -35,16 +35,16 @@ SECRET_KEY = os.environ.get(
 SALT = b"license-salt-muy-segura"
 TOKEN_TTL_HOURS = 2
 
-_pg_pool = None
+PG_POOL = None
 
 
-def _pg_pool():
-    global _pg_pool
-    if _pg_pool is None:
-        _pg_pool = psycopg2.pool.SimpleConnectionPool(
+def get_pg_pool():
+    global PG_POOL
+    if PG_POOL is None:
+        PG_POOL = psycopg2.pool.SimpleConnectionPool(
             1, 10, dsn=DATABASE_URL, sslmode="require"
         )
-    return _pg_pool
+    return PG_POOL
 
 
 def _derive_fernet_key() -> bytes:
@@ -86,7 +86,7 @@ def _pg_exec(conn, raw_sql, args=None, fetch=None):
 def get_db():
     """Devuelve una conexión (Postgres si está configurado, si no SQLite)."""
     if USE_PG:
-        return _pg_pool().getconn()
+        return get_pg_pool().getconn()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -96,7 +96,7 @@ def get_db():
 
 def close_db(conn):
     if USE_PG:
-        _pg_pool().putconn(conn)
+        get_pg_pool().putconn(conn)
     else:
         conn.close()
 
